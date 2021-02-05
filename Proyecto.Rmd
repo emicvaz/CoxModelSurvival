@@ -1,0 +1,537 @@
+---
+title: "Proyecto de Análisis de Supervivencia"
+author: "Emiliano Caballero"
+date: "03/02/2021"
+output: rmarkdown::github_document
+
+---
+
+# Introducción
+
+Se está interesado en estudiar el comportamiento del tiempo hasta que un cliente deja de serlo. Un estudio recabó información de 7043 clientes de una empresa. 
+
+A continuación se presentará un reporte que muestra el procedimiento estadístico realizado hasta determinar un modelo de Cox validado para mostrar una solución al problema.
+
+## Los Datos
+
+Cada fila representa un cliente, cada columna contiene los atributos del cliente descritos en el diccionario.
+
+El conjunto de datos incluye información a cerca de:
+
+* Clientes que se fueron en el último mes: la columna se llama 'Churn'.
+
+* Servicios a los que se ha suscrito cada cliente: teléfono, varias líneas, Internet, seguridad en línea, respaldo en línea, protección de dispositivos, soporte técnico y transmisión de TV y películas.
+
+* Información de la cuenta del cliente: cuánto tiempo ha sido cliente, contrato, método de pago, facturación electrónica, cargos mensuales y cargos totales.
+
+* Información demográfica sobre los clientes: sexo, rango de edad y si tienen socios y dependientes.
+
+## Análisis de Supervivencia
+
+En cualquier grupo de clientes lo suficientemente grande como Telco, habrá personas que tengan las mismas características. Algunos de ellos abandonarán y otros no, y lo que idealmente le gustaría saber a las empresas de telecomunicaciones es la probabilidad de abandono de cada grupo. Esto es lo que proporciona, por ejemplo, la regresión logística. Pero no está claro para qué escala de tiempo está proporcioando esta probabilidad de abandono. Por lo tanto, se realizó un análisis de supervivencia para este propósito.
+
+# Obtención y Preparación de los Datos
+
+Los datos se obtienen de de un archivo csv proporcioando. Son 21 variables que contiene el conjunto de datos, 18 tipo factor incluyendo el identificador que es único y 3 tipo numérica.
+
+```{r,include=FALSE,echo=FALSE}
+library(tidyverse)
+library(lubridate)
+library(survival)
+library(KMsurv)
+library(skimr)
+library(knitr)
+library(survminer)
+library(fastDummies)
+
+data <- read.csv("/Users/emilianocaballero/Dropbox/Analisis de Supervivencia/Proyecto Supervivencia/Telco-Customer-Churn.csv", header = TRUE)
+
+```
+
+```{r,include=TRUE,echo=TRUE}
+kable(head(data[,1:8],3))
+kable(head(data[,9:14],3))
+kable(head(data[,15:21],3))
+```
+
+El conjunto de datos ya vienen en formato 'tidy data' y no tiene valores faltantes a excepción de 11 valores de la columna de cargos totales, esto se debe a que el número de meses que el cliente ha permanecido en la empresa(tenure) es de 0. Por lo que se les asignó el valor 0.
+
+
+```{r,include=TRUE,echo=TRUE}
+# El resumen de las personas que poseen servicio de internet o servicio de teléfono es:
+data$has_InternetService <- ifelse(data$InternetService != "No", "Yes", "No")
+data$has_InternetService <- as.factor(data$has_InternetService)
+
+resumen <- data %>% count(PhoneService, has_InternetService)
+resumen$porcentaje <- paste(round((resumen$n/7035)*100,2),"%",sep = )
+
+kable(resumen)
+```
+
+Para la construcción del modelo se necesita que las variables tipo factor tengan la característica de ser variables indicadoras. Es decir, para integrar un factor con a posibles valores en el modelo se necesitan a-1 variables indicadoras. Para esto se creó otra tabla sin alterar las variables numéricas y para las 18 variables tipo factor se hicieron a-1 indicadoras donde a son los niveles que toma la variable tipo factor.
+
+Quedó una tabla de 29 variables; el identificador único, 25 variables tipo indicadora y 3 tipo numérica, incluyendo la variable tenure. Por cuestiones de espacio, sólo se muestra una parte de la tabla.
+
+
+```{r,include=TRUE,echo=TRUE}
+
+data$gender_d <- ifelse(data$gender != "Male", 1,0 )
+data$Partner_d <- ifelse(data$Partner == "Yes", 1,0 )
+data$Dependents_d <- ifelse(data$Dependents == "Yes", 1,0 )
+data$PaperlessBilling_d <- ifelse(data$PaperlessBilling == "Yes", 1,0 )
+data$PhoneService_d <- ifelse(data$PhoneService == "Yes", 1,0 )
+data$MultipleLines_d <- ifelse(data$MultipleLines == "Yes", 1,0 )
+data$OnlineSecurity_d <- ifelse(data$OnlineSecurity == "Yes", 1,0 )
+data$OnlineBackup_d <- ifelse(data$OnlineBackup == "Yes", 1,0 )
+data$DeviceProtection_d <- ifelse(data$DeviceProtection == "Yes", 1,0 )
+data$TechSupport_d <- ifelse(data$TechSupport == "Yes", 1,0 )
+data$StreamingTV_d <- ifelse(data$StreamingTV == "Yes", 1,0 )
+data$StreamingMovies_d <- ifelse(data$StreamingMovies == "Yes", 1,0 )
+data$has_InternetService_d <- ifelse(data$InternetService != "No", 1, 0)
+
+data_tres_levels <- data %>% 
+        select(InternetService,Contract,PaymentMethod)
+
+data_tres_levels_d <-dummy_cols(data_tres_levels)
+
+data_tres_levels_d<- data_tres_levels_d %>% 
+                        select(-c(InternetService,Contract,PaymentMethod))
+
+attach(data)
+data_final <- data.frame(customerID,gender_d,SeniorCitizen,Partner_d,Dependents_d,tenure,
+                         PaperlessBilling_d,PhoneService_d,MultipleLines_d,
+                         OnlineSecurity_d,OnlineBackup_d,DeviceProtection_d,
+                         TechSupport_d,StreamingTV_d,StreamingMovies_d,has_InternetService_d,
+                         data_tres_levels_d,MonthlyCharges,TotalCharges,Churn)
+
+```
+
+```{r,include=TRUE,echo=TRUE}
+kable(head(data_final[,c(1,25:27)]))
+```
+
+# Análisis de Supervivencia: Covariables que afectan el tiempo de Vida
+
+
+Antes de realizar un análisis más detallado, veamos la función de supervivencia estimada por el método de Kaplan-Meier.
+
+Para esto, definimos las variables de interés para el tiempo y la censura. Para este caso tenure es la variable tiempo,que el número de meses que un cliente se ha quedado en la compañía y la variable censura es churn, que es un indicador si el cliente se fue en el último mes o no. 
+
+```{r,include=TRUE,echo=TRUE}
+data$Churn <- ifelse(data$Churn=='Yes',1,0 )
+data_surv <- Surv(data$tenure, data$Churn)
+
+plot(data_surv, xlab="Semanas", ylab="Función de supervivencia", main="Función de supervivencia Kaplan-Meier", col=1:3)
+```
+
+La gráfica anterior nos da una intuición básica a cerca de los clientes.
+
+La rotación es relativamente baja. Después de 20 meses, la probabilidad de que un cliente no cancele el servicio es ligeramente superior al 80% e incluso después de 72 meses, la probabilidad de que la empresa retenga a uno de sus clientes es del 60%.
+
+
+## Inferencias 
+
+Se harán las gráficas de las curvas de supervivencia para las covariables género y si es jubilado y las pruebas de hipótesis para determinar si las funciones de supervivencia de las covariables género y jubilados son iguales, es decir, vamos a determinar si dichas variables influyen o no en el comportamiento del tiempo de la vida para que un cliente abandone o no la empresa.
+
+Las pruebas son las siguientes,para las j subpoblaciones, la hipótesis nula es si las subpoblaciones tienen la misma función de supervivencia y la alternativa es que si existe al menos una subpoblación cuya función de supervivencia no es igual a las demás.En términos de prueba de hipótesis:
+\begin{center}
+$ H_0: S_1(t)=S_2(t)=...S_k(t)$ para toda t
+\end{center}
+\begin{center}
+$ H_1: S_i(t_0)\neq S_j(t_0) $ para algún par i,j en el tiempo $t_0$
+\end{center}
+
+```{r,include=TRUE,echo=TRUE}
+fit <- survfit(data_surv ~ gender_d, data = data)
+ggsurvplot(fit, data = data, 
+           pval = TRUE, 
+           conf.int = TRUE,
+           )
+```
+
+Las curvas de Supervivencia parecen similares y como el p-valor es mayor a el nivel de significancia 0.05 (0.47), la evidencia no es suficiente para rechazar la hipótesis nula, es decir, la variable género parece no influir en el tiempo de vida en el que una persona es cliente hasta que deja de serlo.
+
+```{r,include=TRUE,echo=TRUE}
+fit <- survfit(data_surv ~ SeniorCitizen, data = data)
+ggsurvplot(fit, data = data, 
+           pval = TRUE, 
+           conf.int = TRUE,
+           )
+```
+
+Las curvas de Supervivencia parecen diferentes y como el p-valor es menor a el nivel de significancia 0.05 (<0.0001), la evidencia es suficiente para rechazar la hipótesis nula, es decir, hay evidencia para afirmar que si una persona es jubilada, este factor, influye en el tiempo de vida en el que una persona es cliente hasta que dejan de serlo.
+
+De esta forma es posible graficar la función de supervivencia para cada covariable. Con la misma prueba de hipótesis, se verifica si estas tienen un impacto en el tiempo de vida.
+
+```{r,include=TRUE,echo=TRUE}
+data_r <- data[,c(c(2:5),c(7:18))]
+
+a<-list()
+for (i in 1:16) {
+        
+        a[[i]]<-survdiff(data_surv ~ data_r[,i], data = data_r, rho = 1)
+}
+
+print(a)
+#No se puede guardar el pvalor para ponerlo en otro vector, etc.
+```
+
+Las covariables que no rechazan la hipótesis nula son: PhoneService y Gender. Es decir, para estas dos variables la evidencia no es suficiente para rechazar la hipótesis nula, o sea, las variables Gender y PhoneService no influyen en el tiempo de vida en el que una persona es cliente hasta que deja de serlo.
+
+Ya que para las demás variables su prescencia influye en el tiempo de vida, determinamos las subpoblaciones para las variables que no son dicotómicas que son: InternetService, Contract y PaymentMethod con la prueba de comparaciones múltiples de Peto y Peto. La hipótesis nula es que las subpoblaciones son iguales y la alternativa es que existe no lo son. En otras palabras, si no se rechaza la hipótesis nula entre dos comparaciones, es posible juntar las dos subpoblaciones en una subpoblación. En términos de prueba de hipótesis es:
+
+\begin{center}
+$ H_0: S_i(t)=S_j(t)=...S_k(t)$ para toda t
+\end{center}
+\begin{center}
+$ H_1: S_i(t_0)\neq S_j(t_0) $ para un tiempo $t_0>0$
+\end{center}
+
+```{r,include=TRUE,echo=TRUE}
+pairwise_survdiff(Surv(tenure,Churn) ~ InternetService, data = data, p.adjust.method = "bonferroni",   rho = 1)
+pairwise_survdiff(Surv(tenure,Churn) ~ Contract, data = data, p.adjust.method = "bonferroni",   rho = 1)
+pairwise_survdiff(Surv(tenure,Churn) ~ PaymentMethod, data = data, p.adjust.method = "bonferroni",   rho = 1)
+```
+
+
+La prueba Peto-Peto solamente nos permitió juntar los factores de Credit card y Bank transfer de la covariable PaymentMethod en una sola subpoblación. Las variables dicotómicas que se crearon en la sección pasada se juntaran en una sola que se llama PaymentMethod_BankTransfer_CreditcCard.
+
+```{r,include=TRUE,echo=TRUE}
+data_final$PaymentMethod_BankTransfer_CreditcCard<-data_final$PaymentMethod_Bank.transfer..automatic.+data_final$PaymentMethod_Credit.card..automatic.
+```
+
+
+Estas observaciones son útiles para que la empresa de telecomunicaciones Telco comprenda la agregación, la tendencia y las posibles percepciones comerciales.
+
+
+# Construcción del modelo: Modelo de Riesgos de Cox
+
+El modelo de Cox trata de ajustar los coeficientes de la función de riesgo utilizando un método de verosimilitud parcial. La ventaja de la regresión de riesgos proporcionales de Cox es que los modelos de supervivencia se pueden ajustar sin el supuesto de distribución.
+
+Para empezar, se ajustó un modelo de cox para todas las covariables.
+
+Para esto, se plantea la prueba de hipótesis para la significancia del modelo y la prueba de hipótesis para considerar variables en el modelo dado que ya las demás ya están consideradas.
+
+Para la prueba de hipótesis para la significancia del modelo, la hipótesis nula es que nunguna variables es significativa y la alternativa es que al menos una variable lo es.
+En términos de pruebas de hipótesis:
+
+\begin{center}
+$H_0: b_1 = b_2 = ... = b_\gamma = 0$
+\end{center}
+
+\begin{center}
+$H_1$: Existe un $b_i \neq 0$
+\end{center}
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit <- coxph(data_surv ~ gender_d+SeniorCitizen+Partner_d+Dependents_d+PaperlessBilling_d+PhoneService_d+MultipleLines_d+OnlineSecurity_d+OnlineBackup_d+DeviceProtection_d+TechSupport_d+StreamingTV_d+StreamingMovies_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+PaymentMethod_Electronic.check+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen <- summary(data.model.fit)
+
+kable(as.data.frame(resumen$logtest))
+```
+
+Como el p-valor de la prueba de hipótesis para la significancia del modelo es menor a 0.05, dada la muestra, no hay evidencia para afirmar que todas las variables no deban ser consideradas en el modelo.
+
+Para la significancia de las covariables de manera individual si estas deben estar en el modelo dado que las otras ya están las hipótesis nula es: el coeficiente de la covariables es 0 y la alternativa es, el coeficiente de la covariable es distinto de 0. En términos de prueba de hipótesis, es:
+
+\begin{center}
+$H_0: b_i = 0$
+\end{center}
+
+\begin{center}
+$H_1: b_i \neq 0$
+\end{center}
+
+
+```{r,include=TRUE,echo=TRUE}
+resumdataframe <- as.data.frame(resumen$coefficients)
+kable(resumdataframe[,c(2,3,5)])
+
+#Quitaste InternetService_No, PaymentMethod_Mailed.check, Contract_Month.to.month
+```
+
+
+Las resumen estadístico anterior indican la importancia de las covariables en la predicción del riesgo de abandono.
+
+* En la regresión anterior, la salida  exp(coef) se interpreta como el factor de proporcionalidad entre el riesgo $h(t;X )$ y el riesgo base $h_0$, siendo 1.00 neutral.
+
+* Las covariables Partner, PaperlessBilling, Internet Service (DSL o Fiber Optic), contract (1 year & 2 year), Payment Method (Bank Transfer y Credit Card) y Total Charges tienen un p-valor menor a 0.05 y así, son significativas en el modelo, es decir, deben ser consideradas en el modelo ya que las otras están, por tanto, tienen un rol importante en la predicción de la deserción, mientras que todas las demás covariables no son significativas.
+
+
+## Selección del Modelo
+
+Existen varias estrategias para seleccionar el modelo. A continuación se presentará un método interactivo, que es un método general que consiste en 4 pasos.
+
+### Paso 1
+
+Se ajusta un modelo para cada una las covariables por separado. Se prueba pa significancia de cada uno de ellos y se consideran como posibles candidatos aquellos que resulten significativos.
+
+
+```{r,include=TRUE,echo=TRUE}
+data_ind <- data.frame(gender_d,SeniorCitizen,Partner_d,Dependents_d,
+                         PaperlessBilling_d,PhoneService_d,MultipleLines_d,
+                         OnlineSecurity_d,OnlineBackup_d,DeviceProtection_d,
+                         TechSupport_d,StreamingTV_d,StreamingMovies_d,                        data_tres_levels_d,data_final$PaymentMethod_BankTransfer_CreditcCard,MonthlyCharges,TotalCharges)
+
+exp.coef.ind<-numeric(0)
+se.coef.ind<-numeric(0)
+p.val.ind<-numeric(0)
+resumen.ind<-list()
+for (i in 1:26) {
+        
+resumen.ind[[i]] <- summary(coxph(data_surv ~ data_ind[,i],data = data_ind, method = "breslow",na.action = na.exclude))
+
+exp.coef.ind[i]<-resumen.ind[[i]]$coefficients[,2]
+se.coef.ind[i]<-resumen.ind[[i]]$coefficients[,3]
+p.val.ind[i]<-resumen.ind[[i]]$coefficients[,5]
+
+}
+
+conclsig<-ifelse(p.val.ind < 0.05, "Significativa", "No significativa")
+resumen.ind<-data.frame(colnames(data_ind),exp.coef.ind,p.val.ind,conclsig)
+
+colnames(resumen.ind)<-c("Covariable","exp(coef)","se(coef)","p-value")
+
+kable(resumen.ind)
+
+
+```
+
+Bajo la prueba para la significancia de cada una de las covariables por separado. Las variables que por separado resultaron significativas son: SeniorCitizen, Partner_d, Dependents_d, PaperlessBilling_d, MultipleLines_d, OnlineSecurity_d, OnlineBackup_d, DeviceProtection_d, TechSupport_d, StreamingTV_d, StreamingMovies_d, InternetService_DSL, InternetService_Fiber.optic, InternetService_No, Contract_Month.to.month, Contract_One.year, Contract_Two.year, PaymentMethod_BankTransfer_CreditcCard, PaymentMethod_Electronic.check, MonthlyCharges y Total Charges.
+
+Notar que desde el análisis de covariables que afectan el tiempo de Vida habíamos concluido que ni Gender ni PhoneService tenían un impacto en el comportamiento del tiempo de vida.
+
+#### Paso 2
+
+1. Se ajusta un modelo con todas las variables que resultaron significativas en el paso 1 y se prueba la significancia de cada una de estas variables dado que las restantes ya estan consideradas en el modelo.
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit2 <- coxph(data_surv ~ SeniorCitizen+Partner_d+Dependents_d+PaperlessBilling_d+MultipleLines_d+OnlineSecurity_d+OnlineBackup_d+DeviceProtection_d+TechSupport_d+StreamingTV_d+StreamingMovies_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+PaymentMethod_Electronic.check+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen2 <- summary(data.model.fit2)
+
+resumdataframe2 <- as.data.frame(resumen2$coefficients)
+kable(resumdataframe2[,c(2,3,5)])
+```
+
+2. Así, se descartan todas aquellas que aun cuando por si solas fueron
+significativas, ya no lo son al incluir otras covariables. De esta forma se retiran las covariables: SeniorCitizen, Dependents_d,MultipleLines_d, DeviceProtection_d, StreamingMovies_d, StreamingTV_d y PaymentMethod_Electronic.check.
+
+3. Por lo que se hizo un nuevo análisis con las covariables vigentes.
+
+4. Las variables vigentes son: Partner_d,PaperlessBilling_d,OnlineSecurity_d,OnlineBackup_d,TechSupport_d,
+InternetService_DSL,InternetService_Fiber.optic,Contract_One.year,
+Contract_Two.year, PaymentMethod_BankTransfer_CreditcCard, MonthlyCharges y TotalCharges.
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+```
+
+4. Todas las covariables vigentes resultaron significativas, es decir, todas resultaron significativas dado que las otras variables están incluidas en el modelo.
+
+### Paso 3
+
+Todas las covariables que no se incluyeron en el paso 2, pero que
+fueron consideradas en el paso 1, tienen posibilidad de ser incluidas en el modelo, por lo que se hace un análisis por separado de las variables vigentes con cada una de ellas cuidando el detalle que si una es incluida no altere la significancia de las otras.
+
+1. Se hizo un análisis para las 7 variables que resultaron significativas en el paso 1 pero no resultaron ser vigentes al final del paso 2.
+
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ SeniorCitizen+Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+
+```
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ Dependents_d+Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+
+```
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ MultipleLines_d+Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+```
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ DeviceProtection_d+Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+```
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ StreamingTV_d+Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+```
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ StreamingMovies_d+Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+```
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ PaymentMethod_Electronic.check+Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+```
+
+2. Ninguna de las 7 variables resultó ser significativa dado que las variables vigentes estaban incluidas en el modelo, por lo que se tiene una propuesta para el modelo final.
+
+### Paso 4
+
+Las covariables propuestas para el modelo final son las siguientes. Cada una de las covariables resulta significativa.
+
+```{r,include=TRUE,echo=TRUE}
+data.model.fit3 <- coxph(data_surv ~ Partner_d+PaperlessBilling_d+OnlineSecurity_d+OnlineBackup_d+TechSupport_d+InternetService_DSL+InternetService_Fiber.optic+Contract_One.year+Contract_Two.year+PaymentMethod_BankTransfer_CreditcCard+MonthlyCharges+TotalCharges,
+data = data_final, method = "breslow",na.action = na.exclude)
+
+
+
+resumen3 <- summary(data.model.fit3)
+
+resumdataframe3 <- as.data.frame(resumen3$coefficients)
+kable(resumdataframe3[,c(2,3,5)])
+```
+
+# Validación del modelo
+
+### Riesgos Proporcionales
+
+Se quiere verificar la proporcionalidad de todos los predictores en el modelo. Para esto se realiza una prueba para checar si existe correlación significativa entre los residuos y una transformación del tiempo (Ln(t)).
+
+Se tiene una prueba de hipótesis por cada variable así como una prueba global, basadas cada una en una correlación entre los residuos asociados(Schoenfeld) a cada variable y el eje de tiempo (Ln(t)).
+
+Para esta prueba un p-valor < 0.05 indica una violación del supuesto de proporcionalidad. En términos de pruebas de hipótesis:
+
+\begin{center}
+$H_0$ : El supuesto de riesgos proporcionales se cumple
+\end{center}
+
+\begin{center}
+$H_1$ : El supuesto de riesgos proporcionales no se cumple
+\end{center}
+
+```{r,include=TRUE,echo=TRUE}
+cox.model.fit3 <- cox.zph(data.model.fit3)
+cox.model.fit3
+
+plot(cox.model.fit3 )
+
+```
+
+Como el p-valor de la prueba es menor a 0.05, rechazamos la hipótesis nula, así, el supuesto de riesgos proporcionales no se cumple.
+
+### Residuos Martingales
+
+A menudo, asumimos que las covariables continuas tienen una forma lineal. Sin embargo, esta suposición debe verificarse.
+
+Para verificar si cada variable debe incluirse en la forma lineal en el
+modelo se utilizan los residuos martingala. Una gráfica de los residuos martingala contra cada covariable (continua) debe mostrar una tendencia lineal. Asi que si se le ajusta un modelo, este debe mostrar una tendencia de linea recta.
+
+```{r,include=TRUE,echo=TRUE}
+par(mfrow=c(1, 2))
+
+data.model.fit3.martingalas <- residuals(data.model.fit3, type = 'martingale')
+X<-as.matrix(data_final[,c("MonthlyCharges", "TotalCharges")])
+for (j in 1:2) {
+        scatter.smooth(X[,j], data.model.fit3.martingalas,type="p", pch=".",xlab = c("MonthlyCharges", "TotalCharges")[j], ylab = "Residuos Martingalas")
+
+}
+```
+
+Como las gráficas tienen forma de línea recta, no existe evidencia en contra de la linealidad.
+
+# Interpretación del modelo
+
+Se compararán dos subpoblaciones definidas por valores de las covariables incluidas en el modelo final.
+
+El modelo de Cox estimado es el siguiente
+
+$h(t;X) =$ $h_0(t)$ exp(- 0.204131756Partner_d + 0.131431437PaperlessBilling_d- 
+0.325691569OnlineSecurity_d- 0.196040260OnlineBackup_d- 0.201339127TechSupport_d + 
+1.377491784InternetService_DSL +  1.696373348InternetService_Fiber - 1.271569639Contract_One.year
+- 3.685727093Contract_Two.year- 0.409154637PaymentMethod_BankTransfer_CreditcCard +  0.040366556MonthlyCharges - 0.001525796TotalCharges)
+
+$X =$ (Partner_d, PaperlessBilling_d,OnlineSecurity_d,OnlineBackup_d,TechSupport_d,InternetService_DSL,InternetService_Fiber, Contract_One.year ,Contract_Two.year,PaymentMethod_BankTransfer_CreditcCard, MonthlyCharges, TotalCharges)
+
+$X1 = (1,0,0,0,1,0,1,1,0,0,50,700)$ 
+
+Grupo 1: El cliente es socio, no factura electronicamente, no tiene servicio de seguridad online ni un respaldo online, tiene soporte de tecnología, no tiene internet tipo DSL pero sí tiene fibra óptica, su contrato es a un año, no paga con tranferencia o tarjeta, paga al mes 50 y en cargos totales en el año pagó 700.
+
+$X1 = (1,1,0,0,0,0,1,0,1,1,70,900)$ 
+
+Grupo 2: El cliente es socio, sí factura electronicamente, no tiene servicio de seguridad online ni un respaldo online, tampoco soporte de tecnología, no tiene internet tipo DSL pero sí tiene fibra óptica, su contrato es a dos añoS, paga con transferencia o tarjeta ,paga al mes 70 y en cargos totales en el año pagó 900.
+
+```{r,echo=TRUE,include=TRUE}
+exp(- 0.204131756*1 + 0.131431437*0-  0.325691569*0- 0.196040260*0- 0.201339127*1 +  1.377491784*0 +  1.696373348*1 - 1.271569639*1 - 3.685727093*0- 0.409154637*0+  0.040366556*50 - 0.001525796*700)/exp(- 0.204131756*1 + 0.131431437*1-  0.325691569*- 0.196040260*0- 0.201339127*0 +  1.377491784*0 +  1.696373348*1 - 1.271569639*0 - 3.685727093*1- 0.409154637*1+  0.040366556*70 - 0.001525796*900)
+```
+
+
+$$\frac{h(t;X1)}{h(t;X2)} = 7.3>1 $$
+El grupo 1 tiene mayor riesgo que el grupo dos, de hecho el riesgo en un tiempo t para el grupo 1 es
+7.3 veces el riesgo del grupo 2. Se observa que son muy diferentes las funciones de riesgo.
+La probabilidad de que una persona abandone la compañía del grupo 1 sea después de un tiempo t, es menor a que la probabilidad de que una persona del grupo 2 abandone después del tiempo t. 
+
